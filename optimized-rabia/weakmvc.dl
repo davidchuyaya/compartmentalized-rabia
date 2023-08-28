@@ -1,0 +1,90 @@
+######################## relation definitions
+# EDB
+.input id `repeat_iter([(my_id,),])` # Assume is 0,1,2,...
+.input replicas `repeat_iter(replicas.clone()) -> map(|r| (r,))` # Assume only contains set of relevant partitioned replica IDs
+.input quorum `repeat_iter([(f+1,),])`
+.input fullQuorum `repeat_iter([(2f+1,),])` # for garbage collection
+.input replica `repeat_iter([(replica,),])` # the replica this weakmvc was decoupled from
+
+# IDB. Note: Most channels are both source and sink
+# sendProposalU: id, payloadId, payload, seq.
+.async sendProposalU `map(|(node_id, v):(u32,(u32,u32,u32,u32,u32))| (node_id, serialize_to_bytes(v))) -> dest_sink(send_proposal_sink)` `source_stream(send_proposal_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,u32,u32,u32)>(v.unwrap().1).unwrap())`
+# sendStateU: id, phase, seq, state.
+.async sendStateU `map(|(node_id, v):(u32,(u32,u32,u32,u32,i32))| (node_id, serialize_to_bytes(v))) -> dest_sink(send_state_sink)` `source_stream(send_state_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,u32,i32)>(v.unwrap().1).unwrap())`
+# sendVoteU: id, phase, seq, state.
+.async sendVoteU `map(|(node_id, v):(u32,(u32,u32,u32,u32,i32))| (node_id, serialize_to_bytes(v))) -> dest_sink(send_vote_sink)` `source_stream(send_vote_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,u32,i32)>(v.unwrap().1).unwrap())`
+
+# weakMVCIn: payloadId, seq.
+.async weakMVCIn `null::<(u32,u32,u32,)>()` `source_stream(weak_mvc_in_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,)>(v.unwrap().1).unwrap())`
+# weakMVCOutToReplica: payloadId, seq, t.
+.async weakMVCOutToReplica `map(|(node_id, v):(u32,(u32,u32,u32,))| (node_id, serialize_to_bytes(v))) -> dest_sink(weak_mvc_out_sink)` `null::<(u32,u32,u32,u32,)>()`
+# inputs: n, t1, prevT
+.async inputs `map(|(node_id, v):(u32,(u32,u32,u32))| (node_id, serialize_to_bytes(v))) -> dest_sink(inputs_sink)` `null::<(u32,u32,u32)>()` 
+######################## end relation definitions
+
+# Persistence rules
+# Don't persist any data for a sequence after that sequence has been committed (hence the !seqCommitted(seq))
+sendProposal(id, payloadId, seq) :- sendProposalU(id, payloadId, seq)
+sendProposal(id, payloadId, seq) :+ sendProposal(id, payloadId, seq), !seqCommitted(seq)
+stateSent(ph, seq) :+ stateSent(ph, seq), !seqCommitted(seq)
+sendState(id, ph, seq, st) :- sendStateU(id, ph, seq, st)
+sendState(id, ph, seq, st) :+ sendState(id, ph, seq, st), !seqCommitted(seq)
+voteSent(ph, seq) :+ voteSent(ph, seq), !seqCommitted(seq)
+sendVote(id, ph, seq, vo) :- sendVoteU(id, ph, seq, vo)
+sendVote(id, ph, seq, vo) :+ sendVote(id, ph, seq, vo), !seqCommitted(seq)
+majorityProposal(payloadId, seq) :- NewMajorityProposal(payloadId, seq)
+majorityProposal(payloadId, seq) :+ majorityProposal(payloadId, seq), !seqCommitted(seq)
+
+# Exchange stage
+# TODO: These broadcasts include send-to-self. Make sure it's ok.
+sendProposalU@r(i, payloadId, seq) :~ weakMVCIn(payloadId, seq), id(i), replicas(r)
+recvProposalCount(count(id), seq) :- sendProposal(id, _, seq)
+proposalQuorum(seq) :- recvProposalCount(c, seq), quorum(q), (c >= q), !stateSent(ph, seq), (ph == 1)
+stateSent(1, seq) :+ proposalQuorum(seq), !seqCommitted(seq)
+sameProposalCount(count(id), payloadId, seq) :- proposalQuorum(seq), sendProposal(id, payloadId, seq)
+NewMajorityProposal(payloadId, seq) :- sameProposalCount(c, payloadId, seq), quorum(q), (c >= q)
+NewState(1, seq) :- proposalQuorum(seq), NewMajorityProposal(_, seq)
+NewState(0, seq) :- proposalQuorum(seq), !NewMajorityProposal(_, seq)
+
+# Randomized binary consensus stage
+# Round 1
+NewPhase(1, seq) :- proposalQuorum(seq)
+sendStateU@r(i, ph, seq, st) :~ NewPhase(ph, seq), NewState(st, seq), id(i), replicas(r)
+recvStateCount(count(id), ph, seq) :- sendState(id, ph, seq, _)
+stateQuorum(ph, seq) :- recvStateCount(c, ph, seq), quorum(q), (c >= q), !voteSent(ph, seq)
+voteSent(ph, seq) :+ stateQuorum(ph, seq), !seqCommitted(seq)
+sameStateCount(count(id), ph, seq, st) :- stateQuorum(ph, seq), sendState(id, ph, seq, st)
+sameStateQuorum(ph, seq, st) :- sameStateCount(c, ph, seq, st), quorum(q), (c >= q)
+NewVote(st, ph, seq) :- stateQuorum(ph, seq), sameStateQuorum(ph, seq, st)
+NewVote(-1, ph, seq) :- stateQuorum(ph, seq), !sameStateQuorum(_, seq, _)
+
+# Round 2
+sendVoteU@r(i, ph, seq, vo) :~ NewVote(vo, ph, seq), id(i), replicas(r)
+recvVoteCount(count(id), ph, seq) :- sendVote(id, ph, seq, _)
+voteQuorum(ph, seq) :- recvVoteCount(c, ph, seq), quorum(q), (c >= q), !stateSent(ph2, seq), (ph2 > ph)
+stateSent(ph+1, seq) :+ voteQuorum(ph, seq), !seqCommitted(seq)
+sameVoteCount(count(id), ph, seq, vo) :- voteQuorum(ph, seq), sendVote(id, ph, seq, vo)
+sameVoteQuorum(ph, seq, vo) :- sameVoteCount(c, ph, seq, vo), quorum(q), (c >= q)
+# If a non-? value appears >= f+1 times
+nonQValueVoteQuorum(ph, seq, vo) :- sameVoteQuorum(ph, seq, vo), (vo != -1)
+weakMVCOut@r(payloadId, seq) :~ majorityProposal(payloadId, seq), nonQValueVoteQuorum(_, seq, vo), (vo == 1), replica(r)
+weakMVCOut@r(-1, seq) :~ nonQValueVoteQuorum(_, seq, vo), (vo == 0), replica(r)
+seqCommitted(seq) :- nonQValueVoteQuorum(_, seq, _), sameVoteCount(c, ph, seq, vo), fullQuorum(c) # Garbage collect
+# If a non-? value appears at least once
+nonQValueVote(ph, seq, vo) :- sendVote(_, ph, seq, vo), (vo != -1)
+NewState(vo, seq) :- voteQuorum(seq), !nonQValueVoteQuorum(ph, seq, _), nonQValueVote(ph, seq, vo)
+# Else
+NewState(flip, seq) :- voteQuorum(ph, seq), !nonQValueVote(ph, seq), random(ph, flip) # Assumes the random relation accepts a seed as an argument and outputs 0 or 1
+NewPhase(ph+1, seq) :- voteQuorum(ph, seq), !nonQValueVoteQuorum(ph, seq, _)
+
+######################## End WeakMVC
+
+######################## state machine decoupling
+weakMVCOutToReplica@r(payloadId, seq, t1) :~ weakMVCOut(payloadId, seq), tick(t1), replica(r)
+weakMVCOutCount(count(*)) :- weakMVCOut(_, _)
+batchSize(n) :- weakMVCOutCount(n)
+batchTimes(t1) :+ batchSize(n), tick(t1) # Since there's only 1 r to be batched, (n != 0) is implied
+batchTimes(t1) :+ !batchSize(n), batchTimes(t1) # Persist if no batch
+inputs@pid(n, t1, prevT) :~ batchSize(n), tick(t1), batchTimes(prevT), replica(r)
+inputs@pid(n, t1, 0) :~ batchSize(n), tick(t1), !batchTimes(prevT), replica(r)
+######################## end state machine decoupling
