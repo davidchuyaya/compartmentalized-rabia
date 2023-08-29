@@ -16,7 +16,7 @@
 # weakMVCIn: payloadId, seq.
 .async weakMVCIn `map(|(node_id, v):(u32,(u32,u32,))| (node_id, serialize_to_bytes(v))) -> dest_sink(weak_mvc_in_sink)` `null::<(u32,u32,u32,)>()`
 # weakMVCOut: payloadId, seq, t.
-.async weakMVCOutToReplica `null::<(u32,u32,u32,u32,)>()` `source_stream(weak_mvc_out_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,u32,)>(v.unwrap().1).unwrap())`
+.async weakMVCOutU `null::<(u32,u32,u32,u32,)>()` `source_stream(weak_mvc_out_source) -> map(|v: Result<BytesMut, _>| deserialize_from_bytes::<(u32,u32,u32,u32,)>(v.unwrap().1).unwrap())`
 # inputs: n, t1, prevT
 .async inputsU `null::<(u32,u32,u32)>()` `source_stream(inputs_source) -> map(|v| deserialize_from_bytes::<(u32,u32,u32)>(v.unwrap().1).unwrap())`
 ######################## end relation definitions
